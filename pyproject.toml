@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling==1.28.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manuscript-workspace"
+version = "0.1.0"
+description = "Local-first MCP tools for safely reading and editing manuscript folders from ChatGPT Developer Mode."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Manuscript Workspace" }]
+dependencies = [
+  "mcp[cli]==1.28.1",
+  "pydantic==2.13.4",
+  "uvicorn==0.38.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "pytest==9.1.1",
+]
+
+[project.scripts]
+manuscript-workspace = "manuscript_workspace.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manuscript_workspace"]

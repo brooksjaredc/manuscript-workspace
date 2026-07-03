@@ -1,0 +1,14 @@
+{
+  "project_name": "Untitled Novel",
+  "reference_documents": [
+    "creative-constitution.md",
+    "story-scratchbook.md",
+    "characters.md",
+    "timeline.md"
+  ],
+  "chapter_globs": [
+    "chapters/*.md",
+    "chapter-*.md"
+  ],
+  "deletion_enabled": false
+}
