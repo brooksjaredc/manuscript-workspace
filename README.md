@@ -278,6 +278,30 @@ Use Manuscript Workspace. Import the latest downloaded image into assets/images/
 Use Manuscript Workspace. List all workspace images for chapter-02.
 ```
 
+## Saving ChatGPT Generated Images Directly
+
+The MCP app cannot automatically receive generated image bytes from ChatGPT. MCP tools can receive text arguments and file paths, but the generated image blob displayed in the browser is not passed into the MCP server. The local browser extension solves that gap by saving the actual displayed image from the ChatGPT page to localhost.
+
+Install the extension:
+
+1. Keep Manuscript Workspace running locally on `http://127.0.0.1:8000`.
+2. Open Chrome.
+3. Go to `chrome://extensions`.
+4. Enable Developer mode.
+5. Click Load unpacked.
+6. Select the `browser-extension/` folder from this repo.
+
+Use it:
+
+1. Generate an image in ChatGPT.
+2. Click `Save to Workspace` on the generated image.
+3. Enter an optional filename, chapter folder such as `chapter-02`, and description.
+4. The image is posted to `http://127.0.0.1:8000/local/save-generated-image`.
+5. The image appears under `assets/images/`.
+6. Metadata appears in `assets/image-metadata.json`.
+
+The local save endpoint only accepts localhost Host headers and is not intended to be used through the public ngrok MCP connector.
+
 ## Tools
 
 Read tools:

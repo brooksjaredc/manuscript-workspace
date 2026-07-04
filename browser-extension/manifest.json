@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Manuscript Workspace Image Saver",
+  "version": "0.1.5",
+  "description": "Save generated ChatGPT images into your local Manuscript Workspace.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Manuscript Workspace",
+    "default_popup": "popup.html"
+  }
+}

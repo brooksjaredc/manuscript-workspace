@@ -10,11 +10,15 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
+from starlette.datastructures import UploadFile
+from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from manuscript_workspace.errors import ManuscriptError
+from manuscript_workspace.models import APP_VERSION
 from manuscript_workspace.store import ManuscriptStore
 
 SERVER_INSTRUCTIONS = (
@@ -34,6 +38,10 @@ DEFAULT_ALLOWED_HOSTS = (
     "*.ngrok-free.dev",
     "*.ngrok.app",
 )
+LOCAL_EXTENSION_ORIGINS = (
+    "https://chatgpt.com",
+    "https://chat.openai.com",
+)
 
 
 def _ok(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -52,6 +60,26 @@ def allowed_hosts_from_environment() -> list[str]:
     return list(dict.fromkeys([*DEFAULT_ALLOWED_HOSTS, *configured]))
 
 
+def _is_local_host_header(host: str | None) -> bool:
+    if not host:
+        return False
+    normalized = host.lower().strip()
+    if normalized.startswith("[::1]"):
+        return True
+    if normalized == "::1":
+        return True
+    hostname = normalized.rsplit(":", 1)[0] if ":" in normalized else normalized
+    return hostname in {"127.0.0.1", "localhost"}
+
+
+def _is_server_bound_locally() -> bool:
+    return os.environ.get("MANUSCRIPT_BIND_HOST", "127.0.0.1") in {"127.0.0.1", "localhost", "::1"}
+
+
+def _local_host_error() -> JSONResponse:
+    return JSONResponse({"ok": False, "error": {"code": "local_host_required", "message": "This endpoint only accepts localhost Host headers."}}, status_code=403)
+
+
 def create_mcp(store: ManuscriptStore) -> FastMCP:
     mcp = FastMCP(
         "Manuscript Workspace",
@@ -60,6 +88,7 @@ def create_mcp(store: ManuscriptStore) -> FastMCP:
         json_response=True,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
+    mcp._mcp_server.version = APP_VERSION
     read_annotations = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
     write_annotations = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
     destructive_annotations = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False)
@@ -305,7 +334,52 @@ def create_app(store: ManuscriptStore) -> Starlette:
     async def health(_: object) -> JSONResponse:
         return JSONResponse(store.health())
 
+    async def local_status(request: Request) -> JSONResponse:
+        if not _is_server_bound_locally() or not _is_local_host_header(request.headers.get("host")):
+            return _local_host_error()
+        return JSONResponse(
+            {
+                "ok": True,
+                "project_name": store.config.project_name,
+                "root_name": store.root.name,
+                "image_asset_root": store.config.image_asset_root,
+            }
+        )
+
+    async def save_generated_image(request: Request) -> JSONResponse:
+        if not _is_server_bound_locally() or not _is_local_host_header(request.headers.get("host")):
+            return _local_host_error()
+        try:
+            form = await request.form()
+            image = form.get("image")
+            if not isinstance(image, UploadFile):
+                raise ManuscriptError("missing_image_upload", "Multipart field 'image' is required.")
+            image_bytes = await image.read()
+            tags_value = form.get("tags")
+            tags = [tag.strip() for tag in str(tags_value).split(",") if tag.strip()] if tags_value else None
+            result = store.save_generated_image_upload(
+                image_bytes=image_bytes,
+                content_type=image.content_type,
+                browser_filename=image.filename,
+                filename=str(form.get("filename")) if form.get("filename") else None,
+                chapter=str(form.get("chapter")) if form.get("chapter") else None,
+                description=str(form.get("description")) if form.get("description") else None,
+                generation_prompt=str(form.get("prompt")) if form.get("prompt") else None,
+                tags=tags,
+            )
+            return JSONResponse(result)
+        except ManuscriptError as exc:
+            return JSONResponse({"ok": False, **exc.to_dict()}, status_code=400)
+
     app = mcp.streamable_http_app()
     app.router.routes.append(Route("/health", health, methods=["GET"]))
+    app.router.routes.append(Route("/local/status", local_status, methods=["GET"]))
+    app.router.routes.append(Route("/local/save-generated-image", save_generated_image, methods=["POST"]))
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts_from_environment(), www_redirect=False)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(LOCAL_EXTENSION_ORIGINS),
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
     return app

@@ -25,7 +25,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from manuscript_workspace.errors import ManuscriptError
-from manuscript_workspace.models import DocumentMetadata, ManuscriptConfig, SUPPORTED_EXTENSIONS
+from manuscript_workspace.models import APP_VERSION, DocumentMetadata, ManuscriptConfig, SUPPORTED_EXTENSIONS
 
 LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +40,12 @@ IMAGE_MIME_EXTENSIONS = {
     "image/webp": ".webp",
     "image/gif": ".gif",
     "image/svg+xml": ".svg",
+}
+DIRECT_UPLOAD_MIME_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
 }
 
 
@@ -82,6 +88,7 @@ class ManuscriptStore:
     def health(self) -> dict[str, Any]:
         return {
             "status": "ok",
+            "version": APP_VERSION,
             "project_name": self.config.project_name,
             "root_name": self.root.name,
             "deletion_enabled": self.config.deletion_enabled,
@@ -597,6 +604,93 @@ class ManuscriptStore:
             "snapshot_version": snapshot_version,
         }
 
+    def save_generated_image_upload(
+        self,
+        *,
+        image_bytes: bytes,
+        content_type: str | None,
+        browser_filename: str | None,
+        filename: str | None,
+        chapter: str | None,
+        description: str | None,
+        generation_prompt: str | None,
+        tags: list[str] | None,
+    ) -> dict[str, Any]:
+        if len(image_bytes) > self.config.max_image_base64_bytes:
+            raise ManuscriptError("image_too_large", "Uploaded image exceeds configured maximum size.", {"max_image_base64_bytes": self.config.max_image_base64_bytes})
+        declared_mime_type = (content_type or "").split(";", 1)[0].strip().lower()
+        if declared_mime_type not in DIRECT_UPLOAD_MIME_EXTENSIONS:
+            raise ManuscriptError("unsupported_mime_type", "Uploaded image MIME type is not supported.", {"mime_type": content_type})
+        final_filename = self._safe_upload_filename(filename or browser_filename, declared_mime_type)
+        folder = self._safe_chapter_folder(chapter) if chapter else None
+        relative = f"{self.config.image_asset_root.rstrip('/')}/{folder + '/' if folder else ''}{final_filename}"
+        destination = self._resolve_workspace_image_destination(relative, must_exist=False)
+        if destination.path.exists():
+            raise ManuscriptError("destination_exists", "Uploaded image destination already exists.", {"path": destination.relative})
+        image_info = self._validate_image_bytes(image_bytes, destination.path.suffix.lower(), destination.relative)
+        expected_ext = DIRECT_UPLOAD_MIME_EXTENSIONS[declared_mime_type]
+        if destination.path.suffix.lower() not in ({".jpg", ".jpeg"} if expected_ext == ".jpg" else {expected_ext}):
+            raise ManuscriptError("mime_extension_mismatch", "Destination extension does not match uploaded MIME type.", {"path": destination.relative})
+        self._atomic_write_bytes(destination.path, image_bytes)
+        metadata_entry = self._upsert_image_metadata(
+            source_path=None,
+            source_relative_path=None,
+            source_import_root=None,
+            destination_relative_path=destination.relative,
+            image_type=image_info["image_type"],
+            dimensions=image_info.get("dimensions"),
+            file_size=len(image_bytes),
+            sha256=self._sha256_for_bytes(image_bytes),
+            description=description,
+            generation_prompt=generation_prompt,
+            associated_chapter=chapter,
+            tags=tags,
+            overwrite=False,
+            declared_mime_type=declared_mime_type,
+            source="chatgpt-browser-extension",
+            original_filename=browser_filename,
+        )
+        return {
+            "ok": True,
+            "relative_path": destination.relative,
+            "sha256": metadata_entry["sha256"],
+            "size_bytes": len(image_bytes),
+            "metadata": metadata_entry,
+        }
+
+    def _safe_upload_filename(self, raw_filename: str | None, mime_type: str) -> str:
+        suffix = DIRECT_UPLOAD_MIME_EXTENSIONS[mime_type]
+        if raw_filename:
+            basename = Path(raw_filename).name
+            if basename != raw_filename or ".." in Path(raw_filename).parts:
+                raise ManuscriptError("path_traversal_rejected", "Uploaded filename must not contain path separators or traversal.")
+            stem = Path(basename).stem
+            supplied_suffix = Path(basename).suffix.lower()
+            if supplied_suffix and supplied_suffix not in SUPPORTED_IMAGE_EXTENSIONS:
+                raise ManuscriptError("unsupported_image_extension", "Uploaded filename has an unsupported image extension.", {"filename": raw_filename})
+            if supplied_suffix and supplied_suffix in {".svg"}:
+                raise ManuscriptError("unsupported_image_extension", "Direct browser uploads support png, jpg, jpeg, webp, and gif.", {"filename": raw_filename})
+            if supplied_suffix:
+                suffix = supplied_suffix
+        else:
+            stem = "chatgpt-image-" + datetime.now(UTC).strftime("%Y-%m-%d-%H%M%S")
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip(".-_")
+        if not stem:
+            stem = "chatgpt-image-" + datetime.now(UTC).strftime("%Y-%m-%d-%H%M%S")
+        return f"{stem}{suffix}"
+
+    @staticmethod
+    def _safe_chapter_folder(raw_chapter: str) -> str:
+        if Path(raw_chapter).is_absolute() or ".." in Path(raw_chapter).parts:
+            raise ManuscriptError("path_traversal_rejected", "Chapter folder must be a single safe relative folder name.")
+        chapter = raw_chapter.strip().strip("/")
+        if "/" in chapter or "\\" in chapter:
+            raise ManuscriptError("invalid_chapter_folder", "Chapter folder must be a single folder name, such as chapter-02.")
+        sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", chapter).strip(".-_")
+        if not sanitized:
+            raise ManuscriptError("invalid_chapter_folder", "Chapter folder must not be empty.")
+        return sanitized
+
     def _configured_import_roots(self) -> list[Path]:
         roots: list[Path] = []
         for configured in self.config.asset_import_roots:
@@ -746,22 +840,32 @@ class ManuscriptStore:
         tags: list[str] | None,
         overwrite: bool,
         declared_mime_type: str | None = None,
+        source: str | None = None,
+        original_filename: str | None = None,
     ) -> dict[str, Any]:
         metadata = self._read_image_metadata()
         entry = {
-            "original_filename": source_path.name if source_path else None,
+            "original_filename": original_filename if original_filename is not None else (source_path.name if source_path else None),
             "saved_filename": Path(destination_relative_path).name,
             "saved_relative_path": destination_relative_path,
             "imported_at": datetime.now(UTC).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "source_import_folder": str(source_import_root) if source_import_root else None,
             "source_relative_path": source_relative_path,
+            "source": source,
             "file_size": file_size,
+            "size_bytes": file_size,
             "sha256": sha256,
             "image_type": image_type,
+            "mime_type": declared_mime_type,
+            "width": dimensions.get("width") if dimensions else None,
+            "height": dimensions.get("height") if dimensions else None,
             "dimensions": dimensions,
             "description": description,
             "generation_prompt": generation_prompt,
+            "prompt": generation_prompt,
             "associated_chapter": associated_chapter,
+            "chapter": associated_chapter,
             "tags": tags or [],
             "declared_mime_type": declared_mime_type,
             "overwrite": overwrite,

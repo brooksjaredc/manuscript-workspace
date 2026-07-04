@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 
 SUPPORTED_EXTENSIONS = {".md", ".txt", ".json", ".yaml", ".yml"}
+APP_VERSION = "0.3.0"
 
 
 class ManuscriptConfig(BaseModel):

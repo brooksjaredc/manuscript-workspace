@@ -33,6 +33,7 @@ def main() -> None:
         store = ManuscriptStore(Path(root))
     except ManuscriptError as exc:
         raise SystemExit(f"{exc.code}: {exc.message}") from exc
+    os.environ["MANUSCRIPT_BIND_HOST"] = args.host
     uvicorn.run(create_app(store), host=args.host, port=args.port, log_level=args.log_level)
 
 

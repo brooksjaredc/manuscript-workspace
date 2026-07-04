@@ -26,6 +26,7 @@ def write(path: Path, text: str | bytes) -> None:
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
+WEBP_HEADER = b"RIFF\x08\x00\x00\x00WEBPVP8 "
 
 
 @pytest.fixture()
@@ -439,3 +440,136 @@ def test_mcp_initialize_accepts_tunnel_host_header(manuscript_root: Path) -> Non
     assert response.text != "Invalid Host header"
     assert response.status_code == 200
     assert response.json()["result"]["serverInfo"]["name"] == "Manuscript Workspace"
+
+
+def test_local_status_rejects_non_local_host(manuscript_root: Path) -> None:
+    app = create_app(ManuscriptStore(manuscript_root))
+    with TestClient(app, base_url="https://example.ngrok-free.dev") as client:
+        response = client.get("/local/status")
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "local_host_required"
+
+
+def test_local_save_endpoint_saves_valid_png_upload(image_manuscript_root: Path) -> None:
+    app = create_app(ManuscriptStore(image_manuscript_root))
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        response = client.post(
+            "/local/save-generated-image",
+            files={"image": ("browser-original.png", PNG_1X1, "image/png")},
+            data={"filename": "saved.png", "description": "from browser", "prompt": "tiny image", "tags": "chatgpt, test"},
+            headers={"Origin": "https://chatgpt.com"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["relative_path"] == "assets/images/saved.png"
+    assert (image_manuscript_root / body["relative_path"]).read_bytes() == PNG_1X1
+    metadata = json.loads((image_manuscript_root / "assets" / "image-metadata.json").read_text(encoding="utf-8"))
+    entry = metadata["images"][body["relative_path"]]
+    assert entry["source"] == "chatgpt-browser-extension"
+    assert entry["original_filename"] == "browser-original.png"
+    assert entry["mime_type"] == "image/png"
+    assert entry["width"] == 1
+    assert entry["height"] == 1
+    assert entry["prompt"] == "tiny image"
+    assert entry["tags"] == ["chatgpt", "test"]
+
+
+def test_local_save_endpoint_saves_valid_webp_upload(image_manuscript_root: Path) -> None:
+    app = create_app(ManuscriptStore(image_manuscript_root))
+    with TestClient(app, base_url="http://localhost:8000") as client:
+        response = client.post(
+            "/local/save-generated-image",
+            files={"image": ("generated.webp", WEBP_HEADER, "image/webp")},
+            data={"chapter": "chapter-02"},
+            headers={"Origin": "https://chatgpt.com"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["relative_path"].startswith("assets/images/chapter-02/")
+    assert body["relative_path"].endswith(".webp")
+
+
+def test_local_save_endpoint_rejects_unsupported_extension(image_manuscript_root: Path) -> None:
+    app = create_app(ManuscriptStore(image_manuscript_root))
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        response = client.post(
+            "/local/save-generated-image",
+            files={"image": ("generated.png", PNG_1X1, "image/png")},
+            data={"filename": "bad.txt"},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_image_extension"
+
+
+def test_local_save_endpoint_rejects_invalid_image_bytes(image_manuscript_root: Path) -> None:
+    app = create_app(ManuscriptStore(image_manuscript_root))
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        response = client.post(
+            "/local/save-generated-image",
+            files={"image": ("bad.png", b"not a png", "image/png")},
+            data={"filename": "bad.png"},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_image_bytes"
+
+
+def test_local_save_endpoint_rejects_path_traversal_filename(image_manuscript_root: Path) -> None:
+    app = create_app(ManuscriptStore(image_manuscript_root))
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        response = client.post(
+            "/local/save-generated-image",
+            files={"image": ("generated.png", PNG_1X1, "image/png")},
+            data={"filename": "../bad.png"},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "path_traversal_rejected"
+
+
+def test_local_save_endpoint_saves_into_chapter_subfolder(image_manuscript_root: Path) -> None:
+    app = create_app(ManuscriptStore(image_manuscript_root))
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        response = client.post(
+            "/local/save-generated-image",
+            files={"image": ("chapter.png", PNG_1X1, "image/png")},
+            data={"filename": "style-test.png", "chapter": "chapter-04"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["relative_path"] == "assets/images/chapter-04/style-test.png"
+    metadata = json.loads((image_manuscript_root / "assets" / "image-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["images"][body["relative_path"]]["chapter"] == "chapter-04"
+
+
+def test_local_save_endpoint_rejects_non_local_host(image_manuscript_root: Path) -> None:
+    app = create_app(ManuscriptStore(image_manuscript_root))
+    with TestClient(app, base_url="https://example.ngrok-free.dev") as client:
+        response = client.post(
+            "/local/save-generated-image",
+            files={"image": ("generated.png", PNG_1X1, "image/png")},
+        )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "local_host_required"
+
+
+def test_local_extension_cors_preflight(image_manuscript_root: Path) -> None:
+    app = create_app(ManuscriptStore(image_manuscript_root))
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        response = client.options(
+            "/local/save-generated-image",
+            headers={
+                "Origin": "https://chatgpt.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        rejected = client.options(
+            "/local/save-generated-image",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://chatgpt.com"
+    assert rejected.status_code == 400
