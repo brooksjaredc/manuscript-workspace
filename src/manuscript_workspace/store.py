@@ -121,7 +121,10 @@ class ManuscriptStore:
         resolved_parent = candidate.parent.resolve(strict=True) if candidate.parent.exists() else candidate.parent.resolve(strict=False)
         if not self._is_under_root(resolved_parent):
             raise ManuscriptError("path_escape_rejected", "Resolved path escapes MANUSCRIPT_ROOT.", {"path": relative})
-        resolved = candidate.resolve(strict=must_exist)
+        try:
+            resolved = candidate.resolve(strict=must_exist)
+        except FileNotFoundError as exc:
+            raise ManuscriptError("document_not_found", "Document does not exist under MANUSCRIPT_ROOT.", {"path": relative}) from exc
         if must_exist:
             if not self._is_under_root(resolved):
                 raise ManuscriptError("symlink_escape_rejected", "Symlink resolves outside MANUSCRIPT_ROOT.", {"path": relative})
@@ -312,13 +315,32 @@ class ManuscriptStore:
         limit = min(max_combined_characters or self.config.max_combined_read_chars, self.config.max_combined_read_chars)
         used = 0
         documents = []
+        unread_paths = []
         for path in paths:
-            doc = self.read_document(path, max_characters=max(0, limit - used))
+            remaining = limit - used
+            if remaining <= 0:
+                unread_paths.append(path)
+                continue
+            doc = self.read_document(path, max_characters=remaining)
             used += len(doc["content"])
+            if doc.get("truncated"):
+                doc["truncation_instruction"] = "This document hit the combined read limit; reread it with manuscript.read_document and a line range."
             documents.append(doc)
             if used >= limit:
+                unread_paths.extend(paths[len(documents) :])
                 break
-        return {"documents": documents, "combined_characters": used, "truncated": used >= limit and len(documents) < len(paths)}
+        truncated = bool(unread_paths) or any(doc.get("truncated") for doc in documents)
+        return {
+            "documents": documents,
+            "combined_characters": used,
+            "truncated": truncated,
+            "unread_paths": unread_paths,
+            "continuation_instruction": (
+                "Read remaining or truncated documents one at a time with manuscript.read_document and explicit line ranges."
+                if truncated
+                else None
+            ),
+        }
 
     def read_project_context(self, *, max_combined_characters: int | None = None) -> dict[str, Any]:
         paths = list(self.config.reference_documents)

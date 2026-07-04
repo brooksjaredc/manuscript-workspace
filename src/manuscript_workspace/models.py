@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 
 SUPPORTED_EXTENSIONS = {".md", ".txt", ".json", ".yaml", ".yml"}
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.2"
 
 
 class ManuscriptConfig(BaseModel):
@@ -17,7 +17,7 @@ class ManuscriptConfig(BaseModel):
     chapter_globs: list[str] = Field(default_factory=lambda: ["chapters/*.md", "chapter-*.md"])
     deletion_enabled: bool = False
     max_read_chars: int = 80_000
-    max_combined_read_chars: int = 160_000
+    max_combined_read_chars: int = 40_000
     max_write_chars: int = 500_000
     max_search_results: int = 100
     max_search_file_bytes: int = 1_000_000

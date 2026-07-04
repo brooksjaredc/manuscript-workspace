@@ -11,6 +11,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from manuscript_workspace.errors import ManuscriptError
+from manuscript_workspace.export_pdf import chapter_slug, discover_chapters, export_pdf
 from manuscript_workspace.server import create_app, create_mcp
 from manuscript_workspace.store import ManuscriptStore
 
@@ -103,6 +104,24 @@ def test_line_range_read_and_multi_read(manuscript_root: Path) -> None:
     assert doc["total_line_count"] == 3
     result = store.read_documents(["creative-constitution.md", "story-scratchbook.md"])
     assert [item["path"] for item in result["documents"]] == ["creative-constitution.md", "story-scratchbook.md"]
+
+
+def test_missing_document_returns_structured_error(manuscript_root: Path) -> None:
+    with pytest.raises(ManuscriptError) as exc_info:
+        ManuscriptStore(manuscript_root).read_document("Chapter 04 - The Interval - Rough Draft.md")
+    assert exc_info.value.code == "document_not_found"
+
+
+def test_multi_document_read_truncates_with_continuation(tmp_path: Path) -> None:
+    write(tmp_path / "one.md", "a" * 30)
+    write(tmp_path / "two.md", "b" * 30)
+    write(tmp_path / "three.md", "c" * 30)
+    store = ManuscriptStore(tmp_path)
+    result = store.read_documents(["one.md", "two.md", "three.md"], max_combined_characters=50)
+    assert result["truncated"] is True
+    assert result["continuation_instruction"]
+    assert result["documents"][1]["truncated"] is True
+    assert "three.md" in result["unread_paths"]
 
 
 def test_project_context_includes_project_instructions(manuscript_root: Path) -> None:
@@ -366,21 +385,75 @@ def test_save_image_base64_bare_filename_and_size_limit(tmp_path: Path) -> None:
     assert saved["saved_relative_path"] == "assets/images/general/bare.png"
 
 
+def test_chapter_slug_for_spaced_chapter_filename() -> None:
+    assert chapter_slug("Chapter 04 - The Interval - Rough Draft.md") == "chapter-04"
+    assert chapter_slug("chapters/chapter-12.md") == "chapter-12"
+
+
+def test_export_pdf_combines_chapters_and_images(tmp_path: Path) -> None:
+    write(
+        tmp_path / "manuscript.config.json",
+        json.dumps(
+            {
+                "project_name": "PDF Test Novel",
+                "chapter_globs": ["Chapter *.md"],
+                "asset_root": "assets",
+                "image_asset_root": "assets/images",
+            }
+        ),
+    )
+    write(tmp_path / "Chapter 01 - Opening.md", "# Chapter 1\n\nA first paragraph.\n")
+    write(tmp_path / "Chapter 02 - Image Chapter.md", "# Chapter 2\n\nA second paragraph with *emphasis*.\n")
+    write(tmp_path / "assets" / "images" / "chapter-02" / "style-test.png", PNG_1X1)
+    write(
+        tmp_path / "assets" / "image-metadata.json",
+        json.dumps(
+            {
+                "images": {
+                    "assets/images/chapter-02/style-test.png": {
+                        "description": "A tiny style test image."
+                    }
+                }
+            }
+        ),
+    )
+    store = ManuscriptStore(tmp_path)
+    chapters = discover_chapters(store)
+    assert [chapter.image_folder_slug for chapter in chapters] == ["chapter-01", "chapter-02"]
+    output = export_pdf(store, tmp_path / "exports" / "book.pdf")
+    assert output.exists()
+    assert output.read_bytes().startswith(b"%PDF")
+    assert output.stat().st_size > 1000
+
+
 def test_mcp_tool_discovery_and_annotations(manuscript_root: Path) -> None:
     tools = asyncio.run(create_mcp(ManuscriptStore(manuscript_root)).list_tools())
     by_name = {tool.name: tool for tool in tools}
+    assert len(by_name) == 13
     assert "manuscript.read_document" in by_name
     assert "manuscript.apply_patch" in by_name
-    assert "manuscript.list_importable_images" in by_name
-    assert "manuscript.import_image" in by_name
-    assert "manuscript.save_image_base64" in by_name
+    assert "manuscript.list_importable_images" not in by_name
+    assert "manuscript.import_image" not in by_name
+    assert "manuscript.save_image_base64" not in by_name
     assert "manuscript.delete_document" not in by_name
     assert by_name["manuscript.read_document"].annotations.readOnlyHint is True
-    assert by_name["manuscript.list_importable_images"].annotations.readOnlyHint is True
     assert by_name["manuscript.read_document"].annotations.openWorldHint is False
     assert by_name["manuscript.apply_patch"].annotations.readOnlyHint is False
-    assert by_name["manuscript.import_image"].annotations.readOnlyHint is False
     assert by_name["manuscript.write_document"].annotations.destructiveHint is True
+
+
+def test_mcp_image_tools_are_opt_in(monkeypatch: pytest.MonkeyPatch, manuscript_root: Path) -> None:
+    monkeypatch.setenv("MANUSCRIPT_ENABLE_IMAGE_MCP_TOOLS", "1")
+    tools = asyncio.run(create_mcp(ManuscriptStore(manuscript_root)).list_tools())
+    by_name = {tool.name: tool for tool in tools}
+    assert len(by_name) == 18
+    assert "manuscript.list_importable_images" in by_name
+    assert "manuscript.list_workspace_images" in by_name
+    assert "manuscript.get_image_metadata" in by_name
+    assert "manuscript.import_image" in by_name
+    assert "manuscript.save_image_base64" in by_name
+    assert by_name["manuscript.list_importable_images"].annotations.readOnlyHint is True
+    assert by_name["manuscript.import_image"].annotations.readOnlyHint is False
 
 
 def test_mcp_initialize_post_uses_started_lifespan(manuscript_root: Path) -> None:

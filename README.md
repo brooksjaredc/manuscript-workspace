@@ -302,6 +302,34 @@ Use it:
 
 The local save endpoint only accepts localhost Host headers and is not intended to be used through the public ngrok MCP connector.
 
+## Exporting A PDF Book
+
+You can build a local PDF from the command line without using ChatGPT:
+
+```bash
+cd /Users/jcbrooks/manuscript-workspace
+. .venv/bin/activate
+manuscript-export-pdf \
+  --root /Users/jcbrooks/flash-starwars \
+  --output /Users/jcbrooks/flash-starwars/exports/flash-starwars.pdf
+```
+
+The exporter reads chapter files matched by `chapter_globs` in `manuscript.config.json`, renders Markdown-style headings, paragraphs, and simple bullets, and inserts image assets after their matching chapter. A chapter file such as `Chapter 04 - The Interval - Rough Draft.md` maps to images in:
+
+```text
+assets/images/chapter-04/
+```
+
+Useful options:
+
+```bash
+manuscript-export-pdf --root /path/to/book --include-reference creative-constitution.md
+manuscript-export-pdf --root /path/to/book --include-general-images
+manuscript-export-pdf --root /path/to/book --title "My Book Title"
+```
+
+SVG files are skipped during PDF export because the exporter embeds raster images only. They still remain available as workspace assets.
+
 ## Tools
 
 Read tools:
@@ -313,9 +341,6 @@ Read tools:
 - `manuscript.read_project_context`
 - `manuscript.search_documents`
 - `manuscript.get_document_history`
-- `manuscript.list_importable_images`
-- `manuscript.list_workspace_images`
-- `manuscript.get_image_metadata`
 
 Write tools:
 
@@ -325,11 +350,19 @@ Write tools:
 - `manuscript.write_document`
 - `manuscript.rename_document`
 - `manuscript.restore_document_version`
-- `manuscript.import_image`
-- `manuscript.save_image_base64`
 - `manuscript.delete_document`, only when deletion is enabled
 
 Read tools are annotated with `readOnlyHint: true`. Write tools are annotated as local-world tools, and full overwrite, restore, and delete tools carry destructive hints.
+
+Image MCP tools are opt-in because some ChatGPT connector sessions are more reliable with the smaller core discovery surface. Set `MANUSCRIPT_ENABLE_IMAGE_MCP_TOOLS=1` before starting the server to also expose:
+
+- `manuscript.list_importable_images`
+- `manuscript.list_workspace_images`
+- `manuscript.get_image_metadata`
+- `manuscript.import_image`
+- `manuscript.save_image_base64`
+
+The browser extension's local "Save to Workspace" image endpoint does not require these optional MCP tools.
 
 ## Version History And Restore
 

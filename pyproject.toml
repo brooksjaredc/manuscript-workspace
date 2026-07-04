@@ -14,6 +14,7 @@ dependencies = [
   "mcp[cli]==1.28.1",
   "pydantic==2.13.4",
   "python-multipart==0.0.32",
+  "reportlab==5.0.0",
   "uvicorn==0.38.0",
 ]
 
@@ -25,6 +26,7 @@ dev = [
 
 [project.scripts]
 manuscript-workspace = "manuscript_workspace.__main__:main"
+manuscript-export-pdf = "manuscript_workspace.export_pdf:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

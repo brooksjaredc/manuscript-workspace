@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Manuscript Workspace Image Saver",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Save generated ChatGPT images into your local Manuscript Workspace.",
   "permissions": ["storage"],
   "host_permissions": [
