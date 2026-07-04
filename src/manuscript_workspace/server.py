@@ -31,6 +31,7 @@ DEFAULT_ALLOWED_HOSTS = (
     "::1",
     "*.trycloudflare.com",
     "*.ngrok-free.app",
+    "*.ngrok-free.dev",
     "*.ngrok.app",
 )
 
@@ -146,6 +147,40 @@ def create_mcp(store: ManuscriptStore) -> FastMCP:
         return _ok(lambda: store.get_document_history(relative_path))
 
     @mcp.tool(
+        name="manuscript.list_importable_images",
+        description="Use this when the user wants to see recently downloaded or importable images from allowed local import folders.",
+        annotations=read_annotations,
+    )
+    def list_importable_images(
+        import_root_selector: str | None = None,
+        maximum_results: int = 20,
+        modified_within_hours: int = 72,
+    ) -> dict[str, Any]:
+        return _ok(
+            lambda: store.list_importable_images(
+                import_root_selector=import_root_selector,
+                max_results=maximum_results,
+                modified_within_hours=modified_within_hours,
+            )
+        )
+
+    @mcp.tool(
+        name="manuscript.list_workspace_images",
+        description="Use this when the user wants to see generated or imported images already saved in the manuscript workspace.",
+        annotations=read_annotations,
+    )
+    def list_workspace_images(folder_glob: str | None = None, maximum_results: int = 100) -> dict[str, Any]:
+        return _ok(lambda: store.list_workspace_images(folder_glob=folder_glob, max_results=maximum_results))
+
+    @mcp.tool(
+        name="manuscript.get_image_metadata",
+        description="Use this when the user wants metadata details for a saved manuscript image asset without reading image bytes.",
+        annotations=read_annotations,
+    )
+    def get_image_metadata(relative_path: str) -> dict[str, Any]:
+        return _ok(lambda: store.get_image_metadata(relative_path))
+
+    @mcp.tool(
         name="manuscript.create_document",
         description="Use this when you need to create a new manuscript document such as a new chapter.",
         annotations=write_annotations,
@@ -184,6 +219,64 @@ def create_mcp(store: ManuscriptStore) -> FastMCP:
     )
     def rename_document(existing_relative_path: str, new_relative_path: str, expected_revision: str) -> dict[str, Any]:
         return _ok(lambda: store.rename_document(existing_relative_path, new_relative_path, expected_revision))
+
+    @mcp.tool(
+        name="manuscript.import_image",
+        description="Use this when the user wants to copy an image from an allowed local import folder into assets/images in the manuscript workspace.",
+        annotations=write_annotations,
+    )
+    def import_image(
+        destination_relative_path: str,
+        source_relative_path: str | None = None,
+        latest: bool = False,
+        source_import_root: str | None = None,
+        description: str | None = None,
+        generation_prompt: str | None = None,
+        associated_chapter: str | None = None,
+        tags: list[str] | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        return _ok(
+            lambda: store.import_image(
+                source_relative_path=source_relative_path,
+                latest=latest,
+                source_import_root=source_import_root,
+                destination_relative_path=destination_relative_path,
+                description=description,
+                generation_prompt=generation_prompt,
+                associated_chapter=associated_chapter,
+                tags=tags,
+                overwrite=overwrite,
+            )
+        )
+
+    @mcp.tool(
+        name="manuscript.save_image_base64",
+        description="Use this when a client has actual base64 image bytes and wants to save them directly under assets/images.",
+        annotations=write_annotations,
+    )
+    def save_image_base64(
+        destination_relative_path: str,
+        base64_image_data: str,
+        declared_mime_type: str,
+        description: str | None = None,
+        generation_prompt: str | None = None,
+        associated_chapter: str | None = None,
+        tags: list[str] | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        return _ok(
+            lambda: store.save_image_base64(
+                destination_relative_path=destination_relative_path,
+                base64_image_data=base64_image_data,
+                declared_mime_type=declared_mime_type,
+                description=description,
+                generation_prompt=generation_prompt,
+                associated_chapter=associated_chapter,
+                tags=tags,
+                overwrite=overwrite,
+            )
+        )
 
     @mcp.tool(
         name="manuscript.restore_document_version",

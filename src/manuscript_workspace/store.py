@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import difflib
 import filecmp
 import fnmatch
@@ -11,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import struct
 import tempfile
 import time
 from dataclasses import dataclass
@@ -30,12 +33,27 @@ EXCLUDED_DIRS = {".git", ".manuscript-history", "node_modules", "__pycache__"}
 VENV_DIR_NAMES = {".venv", "venv", "env", ".env"}
 TEMP_SUFFIXES = {".swp", ".swo", ".tmp", ".temp"}
 PROJECT_INSTRUCTIONS = "chatgpt-project-instructions.md"
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}
+IMAGE_MIME_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/svg+xml": ".svg",
+}
 
 
 @dataclass(frozen=True, slots=True)
 class ResolvedPath:
     relative: str
     path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ImportSource:
+    relative: str
+    path: Path
+    root: Path
 
 
 class ManuscriptStore:
@@ -145,6 +163,9 @@ class ManuscriptStore:
             return self._sha256_bytes(path.read_bytes())
         except OSError as exc:
             raise ManuscriptError("read_failed", "Could not read document.", {"path": self._display_path(path)}) from exc
+
+    def _sha256_for_bytes(self, data: bytes) -> str:
+        return self._sha256_bytes(data)
 
     def _display_path(self, path: Path) -> str:
         try:
@@ -381,6 +402,466 @@ class ManuscriptStore:
                     return {"results": results, "truncated": True}
         return {"results": results, "truncated": False}
 
+    def list_importable_images(
+        self,
+        *,
+        import_root_selector: str | None = None,
+        max_results: int = 20,
+        modified_within_hours: int = 72,
+    ) -> dict[str, Any]:
+        roots = self._selected_import_roots(import_root_selector)
+        cutoff = time.time() - (modified_within_hours * 3600)
+        results: list[dict[str, Any]] = []
+        for root in roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            for path in root.rglob("*"):
+                if not path.is_file() or path.name.startswith("."):
+                    continue
+                resolved = path.resolve(strict=True)
+                if not self._is_under(resolved, root):
+                    continue
+                stat = resolved.stat()
+                if stat.st_mtime < cutoff:
+                    continue
+                try:
+                    image_info = self._validate_image_file(resolved, display_path=path.name)
+                except ManuscriptError:
+                    continue
+                results.append(
+                    {
+                        "filename": resolved.name,
+                        "import_root": root.name,
+                        "import_root_path": str(root),
+                        "relative_path": resolved.relative_to(root).as_posix(),
+                        "size_bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+                        "image_type": image_info["image_type"],
+                        "sha256": self.revision_for_path(resolved),
+                        "dimensions": image_info.get("dimensions"),
+                    }
+                )
+        results.sort(key=lambda item: item["modified_at"], reverse=True)
+        return {"images": results[: max(max_results, 0)], "truncated": len(results) > max(max_results, 0)}
+
+    def list_workspace_images(self, *, folder_glob: str | None = None, max_results: int = 100) -> dict[str, Any]:
+        if folder_glob and (Path(folder_glob).is_absolute() or ".." in Path(folder_glob).parts):
+            raise ManuscriptError("invalid_glob", "Image glob must be relative and must not contain '..'.")
+        metadata = self._read_image_metadata()
+        root = self._image_asset_root_path()
+        images: list[dict[str, Any]] = []
+        if root.exists():
+            for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+                if not path.is_file() or path.name.startswith(".") or path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+                    continue
+                resolved = path.resolve(strict=True)
+                if not self._is_under_root(resolved):
+                    continue
+                rel = path.relative_to(self.root).as_posix()
+                if folder_glob and not fnmatch.fnmatch(rel, folder_glob):
+                    continue
+                try:
+                    self._validate_image_file(resolved, display_path=rel)
+                except ManuscriptError:
+                    continue
+                stat = resolved.stat()
+                images.append(
+                    {
+                        "relative_path": rel,
+                        "size_bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+                        "sha256": self.revision_for_path(resolved),
+                        "metadata": metadata.get("images", {}).get(rel),
+                    }
+                )
+        return {"images": images[: max(max_results, 0)], "truncated": len(images) > max(max_results, 0)}
+
+    def get_image_metadata(self, relative_path: str) -> dict[str, Any]:
+        resolved = self._resolve_workspace_image_destination(relative_path, must_exist=True)
+        metadata = self._read_image_metadata().get("images", {}).get(resolved.relative)
+        if metadata is None:
+            return {"relative_path": resolved.relative, "metadata": None}
+        return {"relative_path": resolved.relative, "metadata": metadata}
+
+    def import_image(
+        self,
+        *,
+        source_relative_path: str | None = None,
+        latest: bool = False,
+        source_import_root: str | None = None,
+        destination_relative_path: str,
+        description: str | None = None,
+        generation_prompt: str | None = None,
+        associated_chapter: str | None = None,
+        tags: list[str] | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        if latest == (source_relative_path is not None):
+            raise ManuscriptError("invalid_image_source", "Provide either latest=true or a source import relative path, but not both.")
+        source = self._latest_importable_image(source_import_root) if latest else self._resolve_import_source(source_relative_path or "", source_import_root)
+        destination = self._resolve_workspace_image_destination(destination_relative_path, must_exist=False)
+        if destination.path.exists() and not overwrite:
+            raise ManuscriptError("destination_exists", "Destination image already exists; pass overwrite=true only for intentional replacement.", {"path": destination.relative})
+        image_info = self._validate_image_file(source.path, display_path=source.relative)
+        self._ensure_matching_image_extension(destination.path, image_info["image_type"], destination.relative)
+        snapshot_version = None
+        if destination.path.exists():
+            snapshot_version = self._snapshot(destination.relative, destination.path, "import_image_overwrite", description, old_revision=self.revision_for_path(destination.path))
+        data = source.path.read_bytes()
+        self._atomic_write_bytes(destination.path, data)
+        metadata_entry = self._upsert_image_metadata(
+            source_path=source.path,
+            source_relative_path=source.relative,
+            source_import_root=source.root,
+            destination_relative_path=destination.relative,
+            image_type=image_info["image_type"],
+            dimensions=image_info.get("dimensions"),
+            file_size=len(data),
+            sha256=self._sha256_for_bytes(data),
+            description=description,
+            generation_prompt=generation_prompt,
+            associated_chapter=associated_chapter,
+            tags=tags,
+            overwrite=overwrite,
+        )
+        if snapshot_version:
+            self._update_history_new_revision(snapshot_version, self.revision_for_path(destination.path))
+        return {
+            "saved_relative_path": destination.relative,
+            "source_filename": source.path.name,
+            "file_size": len(data),
+            "sha256": metadata_entry["sha256"],
+            "metadata": metadata_entry,
+            "overwritten": overwrite and snapshot_version is not None,
+            "snapshot_version": snapshot_version,
+        }
+
+    def save_image_base64(
+        self,
+        *,
+        destination_relative_path: str,
+        base64_image_data: str,
+        declared_mime_type: str,
+        description: str | None = None,
+        generation_prompt: str | None = None,
+        associated_chapter: str | None = None,
+        tags: list[str] | None = None,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        if declared_mime_type not in IMAGE_MIME_EXTENSIONS:
+            raise ManuscriptError("unsupported_mime_type", "Declared MIME type is not a supported image type.", {"mime_type": declared_mime_type})
+        estimated_size = (len(base64_image_data) * 3) // 4
+        if estimated_size > self.config.max_image_base64_bytes:
+            raise ManuscriptError("image_too_large", "Base64 image exceeds configured maximum size.", {"max_image_base64_bytes": self.config.max_image_base64_bytes})
+        try:
+            data = base64.b64decode(base64_image_data, validate=True)
+        except binascii.Error as exc:
+            raise ManuscriptError("invalid_base64", "Image data is not valid base64.") from exc
+        if len(data) > self.config.max_image_base64_bytes:
+            raise ManuscriptError("image_too_large", "Decoded image exceeds configured maximum size.", {"max_image_base64_bytes": self.config.max_image_base64_bytes})
+        destination = self._resolve_workspace_image_destination(destination_relative_path, must_exist=False, allow_bare_filename=True)
+        if destination.path.exists() and not overwrite:
+            raise ManuscriptError("destination_exists", "Destination image already exists; pass overwrite=true only for intentional replacement.", {"path": destination.relative})
+        image_info = self._validate_image_bytes(data, destination.path.suffix.lower(), destination.relative)
+        expected_ext = IMAGE_MIME_EXTENSIONS[declared_mime_type]
+        if destination.path.suffix.lower() not in ({".jpg", ".jpeg"} if expected_ext == ".jpg" else {expected_ext}):
+            raise ManuscriptError("mime_extension_mismatch", "Destination extension does not match declared MIME type.", {"path": destination.relative})
+        snapshot_version = None
+        if destination.path.exists():
+            snapshot_version = self._snapshot(destination.relative, destination.path, "save_image_base64_overwrite", description, old_revision=self.revision_for_path(destination.path))
+        self._atomic_write_bytes(destination.path, data)
+        metadata_entry = self._upsert_image_metadata(
+            source_path=None,
+            source_relative_path=None,
+            source_import_root=None,
+            destination_relative_path=destination.relative,
+            image_type=image_info["image_type"],
+            dimensions=image_info.get("dimensions"),
+            file_size=len(data),
+            sha256=self._sha256_for_bytes(data),
+            description=description,
+            generation_prompt=generation_prompt,
+            associated_chapter=associated_chapter,
+            tags=tags,
+            overwrite=overwrite,
+            declared_mime_type=declared_mime_type,
+        )
+        if snapshot_version:
+            self._update_history_new_revision(snapshot_version, self.revision_for_path(destination.path))
+        return {
+            "saved_relative_path": destination.relative,
+            "file_size": len(data),
+            "sha256": metadata_entry["sha256"],
+            "metadata": metadata_entry,
+            "overwritten": overwrite and snapshot_version is not None,
+            "snapshot_version": snapshot_version,
+        }
+
+    def _configured_import_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        for configured in self.config.asset_import_roots:
+            root = Path(configured).expanduser().resolve()
+            if root not in roots:
+                roots.append(root)
+        return roots
+
+    def _selected_import_roots(self, selector: str | None) -> list[Path]:
+        roots = self._configured_import_roots()
+        if selector is None:
+            return roots
+        selected = selector.strip()
+        if not selected:
+            return roots
+        matches: list[Path] = []
+        for index, root in enumerate(roots):
+            configured = self.config.asset_import_roots[index]
+            if selected in {root.name, str(root), configured, str(index), str(index + 1)}:
+                matches.append(root)
+        if not matches:
+            raise ManuscriptError("import_root_not_allowed", "Import root selector does not match a configured import root.", {"selector": selector})
+        return matches
+
+    @staticmethod
+    def _is_under(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    def _resolve_import_source(self, raw_path: str, import_root_selector: str | None) -> ImportSource:
+        if not raw_path or raw_path.strip() == "":
+            raise ManuscriptError("invalid_image_source", "Source image path must not be empty.")
+        roots = self._selected_import_roots(import_root_selector)
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_absolute():
+            try:
+                resolved = candidate.resolve(strict=True)
+            except FileNotFoundError as exc:
+                raise ManuscriptError("source_not_found", "Source image was not found in the selected import roots.", {"path": raw_path}) from exc
+            for root in roots:
+                if self._is_under(resolved, root):
+                    if not resolved.is_file():
+                        raise ManuscriptError("not_a_file", "Source image path is not a file.", {"path": raw_path})
+                    self._validate_image_file(resolved, display_path=resolved.name)
+                    return ImportSource(relative=resolved.relative_to(root).as_posix(), path=resolved, root=root)
+            raise ManuscriptError("source_outside_import_roots", "Source image is not inside an allowed import root.")
+        relative = self._normalize_relative(raw_path)
+        for root in roots:
+            try:
+                path = (root / relative).resolve(strict=True)
+            except FileNotFoundError:
+                continue
+            if not self._is_under(path, root):
+                raise ManuscriptError("source_path_escape_rejected", "Source image resolves outside its import root.", {"path": raw_path})
+            if path.is_file():
+                self._validate_image_file(path, display_path=relative)
+                return ImportSource(relative=relative, path=path, root=root)
+        raise ManuscriptError("source_not_found", "Source image was not found in the selected import roots.", {"path": raw_path})
+
+    def _latest_importable_image(self, import_root_selector: str | None) -> ImportSource:
+        newest: ImportSource | None = None
+        newest_mtime = -1.0
+        for root in self._selected_import_roots(import_root_selector):
+            if not root.exists() or not root.is_dir():
+                continue
+            for path in root.rglob("*"):
+                if not path.is_file() or path.name.startswith("."):
+                    continue
+                resolved = path.resolve(strict=True)
+                if not self._is_under(resolved, root):
+                    continue
+                try:
+                    self._validate_image_file(resolved, display_path=resolved.name)
+                except ManuscriptError:
+                    continue
+                mtime = resolved.stat().st_mtime
+                if mtime > newest_mtime:
+                    newest = ImportSource(relative=resolved.relative_to(root).as_posix(), path=resolved, root=root)
+                    newest_mtime = mtime
+        if newest is None:
+            raise ManuscriptError("no_importable_images", "No importable images were found in the selected import roots.")
+        return newest
+
+    def _image_asset_root_path(self) -> Path:
+        relative = self._normalize_relative(self.config.image_asset_root)
+        path = (self.root / relative).resolve(strict=False)
+        if not self._is_under_root(path):
+            raise ManuscriptError("asset_root_escape_rejected", "Configured image asset root escapes MANUSCRIPT_ROOT.")
+        return path
+
+    def _image_metadata_path(self) -> Path:
+        relative = self._normalize_relative(self.config.asset_root)
+        path = (self.root / relative / "image-metadata.json").resolve(strict=False)
+        if not self._is_under_root(path):
+            raise ManuscriptError("asset_root_escape_rejected", "Configured asset root escapes MANUSCRIPT_ROOT.")
+        return path
+
+    def _resolve_workspace_image_destination(self, raw_path: str, *, must_exist: bool, allow_bare_filename: bool = False) -> ResolvedPath:
+        if allow_bare_filename and "/" not in raw_path and "\\" not in raw_path:
+            raw_path = f"{self.config.image_asset_root.rstrip('/')}/general/{raw_path}"
+        relative = self._normalize_relative(raw_path)
+        suffix = Path(relative).suffix.lower()
+        if suffix not in SUPPORTED_IMAGE_EXTENSIONS:
+            raise ManuscriptError("unsupported_image_extension", "Only .png, .jpg, .jpeg, .webp, .gif, and .svg image assets are supported.", {"path": relative})
+        image_root = self._image_asset_root_path()
+        candidate = (self.root / relative).resolve(strict=must_exist)
+        if not self._is_under(candidate if must_exist else candidate.parent.resolve(strict=False), self.root):
+            raise ManuscriptError("path_escape_rejected", "Destination escapes MANUSCRIPT_ROOT.", {"path": relative})
+        if not self._is_under(candidate if must_exist else candidate.parent.resolve(strict=False), image_root):
+            raise ManuscriptError("asset_destination_rejected", "Image destination must be under the configured image asset root.", {"path": relative})
+        if must_exist:
+            if not candidate.is_file():
+                raise ManuscriptError("not_a_file", "Image path is not a file.", {"path": relative})
+            self._validate_image_file(candidate, display_path=relative)
+        return ResolvedPath(relative=relative, path=self.root / relative)
+
+    def _read_image_metadata(self) -> dict[str, Any]:
+        path = self._image_metadata_path()
+        if not path.exists():
+            return {"images": {}}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ManuscriptError("invalid_image_metadata", "assets/image-metadata.json could not be loaded.", {"reason": str(exc)}) from exc
+        if not isinstance(data, dict) or not isinstance(data.get("images", {}), dict):
+            raise ManuscriptError("invalid_image_metadata", "assets/image-metadata.json must contain an object with an images object.")
+        data.setdefault("images", {})
+        return data
+
+    def _upsert_image_metadata(
+        self,
+        *,
+        source_path: Path | None,
+        source_relative_path: str | None,
+        source_import_root: Path | None,
+        destination_relative_path: str,
+        image_type: str,
+        dimensions: dict[str, int] | None,
+        file_size: int,
+        sha256: str,
+        description: str | None,
+        generation_prompt: str | None,
+        associated_chapter: str | None,
+        tags: list[str] | None,
+        overwrite: bool,
+        declared_mime_type: str | None = None,
+    ) -> dict[str, Any]:
+        metadata = self._read_image_metadata()
+        entry = {
+            "original_filename": source_path.name if source_path else None,
+            "saved_filename": Path(destination_relative_path).name,
+            "saved_relative_path": destination_relative_path,
+            "imported_at": datetime.now(UTC).isoformat(),
+            "source_import_folder": str(source_import_root) if source_import_root else None,
+            "source_relative_path": source_relative_path,
+            "file_size": file_size,
+            "sha256": sha256,
+            "image_type": image_type,
+            "dimensions": dimensions,
+            "description": description,
+            "generation_prompt": generation_prompt,
+            "associated_chapter": associated_chapter,
+            "tags": tags or [],
+            "declared_mime_type": declared_mime_type,
+            "overwrite": overwrite,
+        }
+        metadata.setdefault("images", {})[destination_relative_path] = entry
+        self._atomic_write(self._image_metadata_path(), json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+        return entry
+
+    def _validate_image_file(self, path: Path, *, display_path: str) -> dict[str, Any]:
+        suffix = path.suffix.lower()
+        if suffix not in SUPPORTED_IMAGE_EXTENSIONS:
+            raise ManuscriptError("unsupported_image_extension", "Only .png, .jpg, .jpeg, .webp, .gif, and .svg image assets are supported.", {"path": display_path})
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise ManuscriptError("read_failed", "Could not read image file.", {"path": display_path}) from exc
+        return self._validate_image_bytes(data, suffix, display_path)
+
+    def _validate_image_bytes(self, data: bytes, suffix: str, display_path: str) -> dict[str, Any]:
+        if not data:
+            raise ManuscriptError("invalid_image_bytes", "Image file is empty.", {"path": display_path})
+        if suffix not in SUPPORTED_IMAGE_EXTENSIONS:
+            raise ManuscriptError("unsupported_image_extension", "Only .png, .jpg, .jpeg, .webp, .gif, and .svg image assets are supported.", {"path": display_path})
+        if suffix == ".png":
+            return self._validate_png(data, display_path)
+        if suffix in {".jpg", ".jpeg"}:
+            return self._validate_jpeg(data, display_path)
+        if suffix == ".gif":
+            return self._validate_gif(data, display_path)
+        if suffix == ".webp":
+            return self._validate_webp(data, display_path)
+        if suffix == ".svg":
+            return self._validate_svg(data, display_path)
+        raise ManuscriptError("unsupported_image_extension", "Unsupported image extension.", {"path": display_path})
+
+    @staticmethod
+    def _validate_png(data: bytes, display_path: str) -> dict[str, Any]:
+        if len(data) < 24 or not data.startswith(b"\x89PNG\r\n\x1a\n") or data[12:16] != b"IHDR":
+            raise ManuscriptError("invalid_image_bytes", "PNG image header is invalid.", {"path": display_path})
+        width, height = struct.unpack(">II", data[16:24])
+        return {"image_type": "png", "dimensions": {"width": width, "height": height}}
+
+    @staticmethod
+    def _validate_gif(data: bytes, display_path: str) -> dict[str, Any]:
+        if len(data) < 10 or not (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
+            raise ManuscriptError("invalid_image_bytes", "GIF image header is invalid.", {"path": display_path})
+        width, height = struct.unpack("<HH", data[6:10])
+        return {"image_type": "gif", "dimensions": {"width": width, "height": height}}
+
+    @staticmethod
+    def _validate_webp(data: bytes, display_path: str) -> dict[str, Any]:
+        if len(data) < 16 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+            raise ManuscriptError("invalid_image_bytes", "WebP image header is invalid.", {"path": display_path})
+        return {"image_type": "webp", "dimensions": None}
+
+    @staticmethod
+    def _validate_svg(data: bytes, display_path: str) -> dict[str, Any]:
+        if b"\x00" in data[:4096]:
+            raise ManuscriptError("invalid_image_bytes", "SVG must be text, not binary data.", {"path": display_path})
+        try:
+            text = data[:4096].decode("utf-8", errors="strict").lstrip()
+        except UnicodeDecodeError as exc:
+            raise ManuscriptError("invalid_image_bytes", "SVG must be valid UTF-8 text.", {"path": display_path}) from exc
+        if "<svg" not in text[:1000].lower():
+            raise ManuscriptError("invalid_image_bytes", "SVG image header is invalid.", {"path": display_path})
+        return {"image_type": "svg", "dimensions": None}
+
+    @staticmethod
+    def _validate_jpeg(data: bytes, display_path: str) -> dict[str, Any]:
+        if len(data) < 4 or data[:2] != b"\xff\xd8":
+            raise ManuscriptError("invalid_image_bytes", "JPEG image header is invalid.", {"path": display_path})
+        index = 2
+        while index + 3 < len(data):
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker = data[index + 1]
+            index += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if index + 2 > len(data):
+                break
+            segment_length = struct.unpack(">H", data[index : index + 2])[0]
+            if segment_length < 2 or index + segment_length > len(data):
+                break
+            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF} and segment_length >= 7:
+                height, width = struct.unpack(">HH", data[index + 3 : index + 7])
+                return {"image_type": "jpeg", "dimensions": {"width": width, "height": height}}
+            index += segment_length
+        if data.endswith(b"\xff\xd9"):
+            return {"image_type": "jpeg", "dimensions": None}
+        raise ManuscriptError("invalid_image_bytes", "JPEG image header is invalid.", {"path": display_path})
+
+    @staticmethod
+    def _ensure_matching_image_extension(path: Path, image_type: str, display_path: str) -> None:
+        suffix = path.suffix.lower()
+        allowed = {".jpg", ".jpeg"} if image_type == "jpeg" else {f".{image_type}"}
+        if suffix not in allowed:
+            raise ManuscriptError("image_extension_mismatch", "Destination extension does not match detected image type.", {"path": display_path, "image_type": image_type})
+
     @staticmethod
     def _looks_pathological_regex(pattern: str) -> bool:
         return re.search(r"\((?:[^()\\]|\\.)*[*+](?:[^()\\]|\\.)*\)[*+{]", pattern) is not None
@@ -589,6 +1070,22 @@ class ManuscriptStore:
         tmp_path = Path(tmp_name)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            finally:
+                raise
+
+    def _atomic_write_bytes(self, path: Path, content: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())

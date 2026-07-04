@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import difflib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,11 @@ def write(path: Path, text: str | bytes) -> None:
         path.write_bytes(text)
     else:
         path.write_text(text, encoding="utf-8")
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
 
 
 @pytest.fixture()
@@ -45,6 +52,29 @@ def manuscript_root(tmp_path: Path) -> Path:
     write(tmp_path / ".hidden.md", "hidden\n")
     write(tmp_path / "notes.bin", b"\x00\x01")
     write(tmp_path / "image.md", b"hello\x00world")
+    return tmp_path
+
+
+@pytest.fixture()
+def image_manuscript_root(tmp_path: Path) -> Path:
+    imports = tmp_path / "imports"
+    imports.mkdir()
+    write(imports / "older.png", PNG_1X1)
+    write(imports / "latest.png", PNG_1X1)
+    os.utime(imports / "older.png", (1_700_000_000, 1_700_000_000))
+    os.utime(imports / "latest.png", (1_800_000_000, 1_800_000_000))
+    write(
+        tmp_path / "manuscript.config.json",
+        json.dumps(
+            {
+                "project_name": "Image Test Novel",
+                "asset_import_roots": [str(imports)],
+                "asset_root": "assets",
+                "image_asset_root": "assets/images",
+                "max_image_base64_bytes": 1024,
+            }
+        ),
+    )
     return tmp_path
 
 
@@ -213,15 +243,142 @@ def test_create_document_and_overwrite_guard(manuscript_root: Path) -> None:
         store.create_document("chapters/chapter-03.md", "replacement")
 
 
+def test_list_importable_images_from_configured_root(image_manuscript_root: Path) -> None:
+    store = ManuscriptStore(image_manuscript_root)
+    result = store.list_importable_images(max_results=10, modified_within_hours=1_000_000)
+    names = [image["filename"] for image in result["images"]]
+    assert names[:2] == ["latest.png", "older.png"]
+    assert result["images"][0]["image_type"] == "png"
+    assert result["images"][0]["dimensions"] == {"width": 1, "height": 1}
+
+
+def test_default_import_root_uses_downloads_without_touching_real_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    downloads = home / "Downloads"
+    write(downloads / "downloaded.png", PNG_1X1)
+    manuscript = tmp_path / "book"
+    manuscript.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    result = ManuscriptStore(manuscript).list_importable_images(modified_within_hours=1_000_000)
+    assert result["images"][0]["filename"] == "downloaded.png"
+
+
+def test_import_latest_image_creates_metadata(image_manuscript_root: Path) -> None:
+    store = ManuscriptStore(image_manuscript_root)
+    result = store.import_image(
+        latest=True,
+        destination_relative_path="assets/images/chapter-02/black-grass-style-test.png",
+        description="graphic novel style exploration for Chapter 2",
+        associated_chapter="chapter-02",
+        tags=["style-test", "black-grass"],
+    )
+    saved = image_manuscript_root / result["saved_relative_path"]
+    assert saved.exists()
+    assert result["source_filename"] == "latest.png"
+    assert result["metadata"]["description"] == "graphic novel style exploration for Chapter 2"
+    metadata = json.loads((image_manuscript_root / "assets" / "image-metadata.json").read_text(encoding="utf-8"))
+    assert result["saved_relative_path"] in metadata["images"]
+
+
+def test_import_specific_image_and_list_workspace_images(image_manuscript_root: Path) -> None:
+    store = ManuscriptStore(image_manuscript_root)
+    imported = store.import_image(
+        source_relative_path="older.png",
+        destination_relative_path="assets/images/chapter-01/older-copy.png",
+        generation_prompt="a tiny test image",
+    )
+    workspace = store.list_workspace_images(folder_glob="assets/images/chapter-01/*")
+    assert workspace["images"][0]["relative_path"] == imported["saved_relative_path"]
+    assert workspace["images"][0]["metadata"]["generation_prompt"] == "a tiny test image"
+    metadata = store.get_image_metadata(imported["saved_relative_path"])
+    assert metadata["metadata"]["saved_filename"] == "older-copy.png"
+
+
+def test_image_source_and_destination_traversal_rejected(image_manuscript_root: Path) -> None:
+    store = ManuscriptStore(image_manuscript_root)
+    with pytest.raises(ManuscriptError, match="path_traversal_rejected"):
+        store.import_image(source_relative_path="../latest.png", destination_relative_path="assets/images/general/test.png")
+    with pytest.raises(ManuscriptError, match="path_traversal_rejected"):
+        store.import_image(source_relative_path="latest.png", destination_relative_path="assets/images/../bad.png")
+
+
+def test_image_unsupported_extension_and_invalid_bytes_rejected(image_manuscript_root: Path) -> None:
+    imports = image_manuscript_root / "imports"
+    write(imports / "not-image.txt", "nope")
+    write(imports / "bad.png", b"not a png")
+    store = ManuscriptStore(image_manuscript_root)
+    with pytest.raises(ManuscriptError, match="unsupported_image_extension"):
+        store.import_image(source_relative_path="not-image.txt", destination_relative_path="assets/images/general/not-image.txt")
+    with pytest.raises(ManuscriptError, match="invalid_image_bytes"):
+        store.import_image(source_relative_path="bad.png", destination_relative_path="assets/images/general/bad.png")
+
+
+def test_image_destination_collision_and_overwrite_snapshot(image_manuscript_root: Path) -> None:
+    store = ManuscriptStore(image_manuscript_root)
+    destination = "assets/images/general/collision.png"
+    store.import_image(source_relative_path="older.png", destination_relative_path=destination)
+    with pytest.raises(ManuscriptError, match="destination_exists"):
+        store.import_image(source_relative_path="latest.png", destination_relative_path=destination)
+    overwritten = store.import_image(source_relative_path="latest.png", destination_relative_path=destination, overwrite=True)
+    assert overwritten["overwritten"] is True
+    assert overwritten["snapshot_version"]
+    history = store.get_document_history(destination)["versions"]
+    assert history[0]["operation"] == "import_image_overwrite"
+
+
+def test_metadata_updates_for_multiple_images(image_manuscript_root: Path) -> None:
+    store = ManuscriptStore(image_manuscript_root)
+    first = store.import_image(source_relative_path="older.png", destination_relative_path="assets/images/general/one.png")
+    second = store.import_image(source_relative_path="latest.png", destination_relative_path="assets/images/general/two.png")
+    metadata = json.loads((image_manuscript_root / "assets" / "image-metadata.json").read_text(encoding="utf-8"))
+    assert set(metadata["images"]) == {first["saved_relative_path"], second["saved_relative_path"]}
+
+
+def test_save_image_base64(image_manuscript_root: Path) -> None:
+    store = ManuscriptStore(image_manuscript_root)
+    result = store.save_image_base64(
+        destination_relative_path="assets/images/general/base64.png",
+        base64_image_data=base64.b64encode(PNG_1X1).decode("ascii"),
+        declared_mime_type="image/png",
+        description="saved from base64",
+    )
+    assert (image_manuscript_root / result["saved_relative_path"]).read_bytes() == PNG_1X1
+    assert result["metadata"]["description"] == "saved from base64"
+
+
+def test_save_image_base64_bare_filename_and_size_limit(tmp_path: Path) -> None:
+    write(tmp_path / "manuscript.config.json", json.dumps({"max_image_base64_bytes": 4}))
+    store = ManuscriptStore(tmp_path)
+    with pytest.raises(ManuscriptError, match="image_too_large"):
+        store.save_image_base64(
+            destination_relative_path="too-big.png",
+            base64_image_data=base64.b64encode(PNG_1X1).decode("ascii"),
+            declared_mime_type="image/png",
+        )
+    write(tmp_path / "manuscript.config.json", json.dumps({"max_image_base64_bytes": 1024}))
+    store = ManuscriptStore(tmp_path)
+    saved = store.save_image_base64(
+        destination_relative_path="bare.png",
+        base64_image_data=base64.b64encode(PNG_1X1).decode("ascii"),
+        declared_mime_type="image/png",
+    )
+    assert saved["saved_relative_path"] == "assets/images/general/bare.png"
+
+
 def test_mcp_tool_discovery_and_annotations(manuscript_root: Path) -> None:
     tools = asyncio.run(create_mcp(ManuscriptStore(manuscript_root)).list_tools())
     by_name = {tool.name: tool for tool in tools}
     assert "manuscript.read_document" in by_name
     assert "manuscript.apply_patch" in by_name
+    assert "manuscript.list_importable_images" in by_name
+    assert "manuscript.import_image" in by_name
+    assert "manuscript.save_image_base64" in by_name
     assert "manuscript.delete_document" not in by_name
     assert by_name["manuscript.read_document"].annotations.readOnlyHint is True
+    assert by_name["manuscript.list_importable_images"].annotations.readOnlyHint is True
     assert by_name["manuscript.read_document"].annotations.openWorldHint is False
     assert by_name["manuscript.apply_patch"].annotations.readOnlyHint is False
+    assert by_name["manuscript.import_image"].annotations.readOnlyHint is False
     assert by_name["manuscript.write_document"].annotations.destructiveHint is True
 
 

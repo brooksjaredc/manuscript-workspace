@@ -10,5 +10,10 @@
     "chapters/*.md",
     "chapter-*.md"
   ],
+  "asset_import_roots": [
+    "~/Downloads"
+  ],
+  "asset_root": "assets",
+  "image_asset_root": "assets/images",
   "deletion_enabled": false
 }
