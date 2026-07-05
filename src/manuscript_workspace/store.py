@@ -324,7 +324,7 @@ class ManuscriptStore:
             doc = self.read_document(path, max_characters=remaining)
             used += len(doc["content"])
             if doc.get("truncated"):
-                doc["truncation_instruction"] = "This document hit the combined read limit; reread it with manuscript.read_document and a line range."
+                doc["truncation_instruction"] = "This document hit the combined read limit; reread it with read_document and a line range."
             documents.append(doc)
             if used >= limit:
                 unread_paths.extend(paths[len(documents) :])
@@ -336,7 +336,7 @@ class ManuscriptStore:
             "truncated": truncated,
             "unread_paths": unread_paths,
             "continuation_instruction": (
-                "Read remaining or truncated documents one at a time with manuscript.read_document and explicit line ranges."
+                "Read remaining or truncated documents one at a time with read_document and explicit line ranges."
                 if truncated
                 else None
             ),
@@ -357,7 +357,7 @@ class ManuscriptStore:
                         "path": path,
                         "truncated": True,
                         "content": "",
-                        "truncation_instruction": "Combined context limit reached; read this document directly with manuscript.read_document and a line range.",
+                        "truncation_instruction": "Combined context limit reached; read this document directly with read_document and a line range.",
                     }
                 )
                 continue
@@ -366,7 +366,7 @@ class ManuscriptStore:
                 used += len(doc["content"])
                 if doc["truncated"]:
                     doc["truncation_instruction"] = (
-                        "This project-context result hit a character limit; call manuscript.read_document with line ranges to continue."
+                        "This project-context result hit a character limit; call read_document with line ranges to continue."
                     )
                 documents.append(doc)
             except ManuscriptError as exc:

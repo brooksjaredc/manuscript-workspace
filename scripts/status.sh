@@ -34,7 +34,6 @@ MANUSCRIPT_HOST="${MANUSCRIPT_HOST:-127.0.0.1}"
 MANUSCRIPT_PORT="${MANUSCRIPT_PORT:-8000}"
 PUBLIC_URL="${MANUSCRIPT_PUBLIC_URL:-}"
 PUBLIC_URL="${PUBLIC_URL%/}"
-
 LOCAL_HEALTH="http://$MANUSCRIPT_HOST:$MANUSCRIPT_PORT/health"
 
 if local_health="$(curl -fsS "$LOCAL_HEALTH" 2>/dev/null)"; then
@@ -67,6 +66,40 @@ else
     fi
   else
     fail "Public MCP initialize failed: $PUBLIC_URL/mcp"
+  fi
+
+  if actions_schema="$(curl -fsS "$PUBLIC_URL/openapi.json" 2>/dev/null)"; then
+    if [[ "$actions_schema" == *'"operationId":"read_document"'* || "$actions_schema" == *'"operationId": "read_document"'* ]]; then
+      pass "Public Actions OpenAPI includes read_document: $PUBLIC_URL/openapi.json"
+    else
+      fail "Public Actions OpenAPI did not include read_document: $PUBLIC_URL/openapi.json"
+      echo "      $actions_schema"
+    fi
+  else
+    fail "Public Actions OpenAPI failed: $PUBLIC_URL/openapi.json"
+  fi
+
+  if [[ -n "${MANUSCRIPT_ACTIONS_BEARER_TOKEN:-}" ]]; then
+    actions_response="$(curl -fsS "$PUBLIC_URL/actions/list_documents" \
+      -H "Authorization: Bearer ${MANUSCRIPT_ACTIONS_BEARER_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d '{}' 2>/dev/null)"
+    actions_status=$?
+  else
+    actions_response="$(curl -fsS "$PUBLIC_URL/actions/list_documents" \
+      -H "Content-Type: application/json" \
+      -d '{}' 2>/dev/null)"
+    actions_status=$?
+  fi
+  if [[ "$actions_status" -eq 0 ]]; then
+    if [[ "$actions_response" == *'"documents"'* ]]; then
+      pass "Public Actions list_documents succeeded: $PUBLIC_URL/actions/list_documents"
+    else
+      fail "Public Actions list_documents returned an unexpected response from $PUBLIC_URL/actions/list_documents"
+      echo "      $actions_response"
+    fi
+  else
+    fail "Public Actions list_documents failed: $PUBLIC_URL/actions/list_documents"
   fi
 fi
 

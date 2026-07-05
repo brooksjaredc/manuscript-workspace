@@ -430,16 +430,27 @@ def test_mcp_tool_discovery_and_annotations(manuscript_root: Path) -> None:
     tools = asyncio.run(create_mcp(ManuscriptStore(manuscript_root)).list_tools())
     by_name = {tool.name: tool for tool in tools}
     assert len(by_name) == 13
+    assert "read_document" in by_name
+    assert "apply_patch" in by_name
+    assert "manuscript.read_document" not in by_name
+    assert "list_importable_images" not in by_name
+    assert "import_image" not in by_name
+    assert "save_image_base64" not in by_name
+    assert "delete_document" not in by_name
+    assert by_name["read_document"].annotations.readOnlyHint is True
+    assert by_name["read_document"].annotations.openWorldHint is False
+    assert by_name["apply_patch"].annotations.readOnlyHint is False
+    assert by_name["write_document"].annotations.destructiveHint is True
+
+
+def test_mcp_legacy_dotted_tool_names_are_opt_in(monkeypatch: pytest.MonkeyPatch, manuscript_root: Path) -> None:
+    monkeypatch.setenv("MANUSCRIPT_LEGACY_DOTTED_TOOLS", "1")
+    tools = asyncio.run(create_mcp(ManuscriptStore(manuscript_root)).list_tools())
+    by_name = {tool.name: tool for tool in tools}
+    assert len(by_name) == 13
     assert "manuscript.read_document" in by_name
     assert "manuscript.apply_patch" in by_name
-    assert "manuscript.list_importable_images" not in by_name
-    assert "manuscript.import_image" not in by_name
-    assert "manuscript.save_image_base64" not in by_name
-    assert "manuscript.delete_document" not in by_name
-    assert by_name["manuscript.read_document"].annotations.readOnlyHint is True
-    assert by_name["manuscript.read_document"].annotations.openWorldHint is False
-    assert by_name["manuscript.apply_patch"].annotations.readOnlyHint is False
-    assert by_name["manuscript.write_document"].annotations.destructiveHint is True
+    assert "read_document" not in by_name
 
 
 def test_mcp_image_tools_are_opt_in(monkeypatch: pytest.MonkeyPatch, manuscript_root: Path) -> None:
@@ -447,13 +458,13 @@ def test_mcp_image_tools_are_opt_in(monkeypatch: pytest.MonkeyPatch, manuscript_
     tools = asyncio.run(create_mcp(ManuscriptStore(manuscript_root)).list_tools())
     by_name = {tool.name: tool for tool in tools}
     assert len(by_name) == 18
-    assert "manuscript.list_importable_images" in by_name
-    assert "manuscript.list_workspace_images" in by_name
-    assert "manuscript.get_image_metadata" in by_name
-    assert "manuscript.import_image" in by_name
-    assert "manuscript.save_image_base64" in by_name
-    assert by_name["manuscript.list_importable_images"].annotations.readOnlyHint is True
-    assert by_name["manuscript.import_image"].annotations.readOnlyHint is False
+    assert "list_importable_images" in by_name
+    assert "list_workspace_images" in by_name
+    assert "get_image_metadata" in by_name
+    assert "import_image" in by_name
+    assert "save_image_base64" in by_name
+    assert by_name["list_importable_images"].annotations.readOnlyHint is True
+    assert by_name["import_image"].annotations.readOnlyHint is False
 
 
 def test_mcp_initialize_post_uses_started_lifespan(manuscript_root: Path) -> None:
@@ -481,6 +492,8 @@ def test_mcp_initialize_post_uses_started_lifespan(manuscript_root: Path) -> Non
     assert body["result"]["protocolVersion"] == "2025-06-18"
     assert body["result"]["serverInfo"]["name"] == "Manuscript Workspace"
     assert "tools" in body["result"]["capabilities"]
+    assert "resources" not in body["result"]["capabilities"]
+    assert "prompts" not in body["result"]["capabilities"]
     assert health.status_code == 200
     assert health.json()["status"] == "ok"
 
@@ -513,6 +526,57 @@ def test_mcp_initialize_accepts_tunnel_host_header(manuscript_root: Path) -> Non
     assert response.text != "Invalid Host header"
     assert response.status_code == 200
     assert response.json()["result"]["serverInfo"]["name"] == "Manuscript Workspace"
+
+
+def test_actions_openapi_and_read_document(monkeypatch: pytest.MonkeyPatch, manuscript_root: Path) -> None:
+    monkeypatch.setenv("MANUSCRIPT_PUBLIC_URL", "https://example.ngrok-free.dev")
+    app = create_app(ManuscriptStore(manuscript_root))
+
+    with TestClient(app, base_url="https://example.ngrok-free.dev") as client:
+        setup_response = client.get("/setup")
+        alias_schema_response = client.get("/openapi.json")
+        schema_response = client.get("/actions/openapi.json")
+        read_response = client.post(
+            "/actions/read_document",
+            json={"relative_path": "chapters/chapter-01.md", "start_line": 2, "end_line": 2, "maximum_characters": 1000},
+        )
+        bad_response = client.post("/actions/read_document", json={"relative_path": "../outside.md"})
+
+    assert setup_response.status_code == 200
+    assert "https://example.ngrok-free.dev/openapi.json" in setup_response.text
+    assert alias_schema_response.status_code == 200
+    assert schema_response.status_code == 200
+    assert alias_schema_response.json() == schema_response.json()
+    schema = schema_response.json()
+    assert schema["openapi"] == "3.1.0"
+    assert schema["info"]["version"]
+    assert schema["servers"] == [{"url": "https://example.ngrok-free.dev"}]
+    assert schema["paths"]["/actions/read_document"]["post"]["operationId"] == "read_document"
+    assert "/actions/delete_document" not in schema["paths"]
+    assert read_response.status_code == 200
+    assert read_response.json()["content"] == "Line 2\n"
+    assert bad_response.status_code == 400
+    assert bad_response.json()["error"]["code"] == "path_traversal_rejected"
+
+
+def test_actions_bearer_token(monkeypatch: pytest.MonkeyPatch, manuscript_root: Path) -> None:
+    monkeypatch.setenv("MANUSCRIPT_ACTIONS_BEARER_TOKEN", "secret-test-token")
+    app = create_app(ManuscriptStore(manuscript_root))
+
+    with TestClient(app, base_url="http://127.0.0.1:8000") as client:
+        schema = client.get("/actions/openapi.json").json()
+        rejected = client.post("/actions/list_documents", json={})
+        accepted = client.post(
+            "/actions/list_documents",
+            json={},
+            headers={"Authorization": "Bearer secret-test-token"},
+        )
+
+    assert schema["security"] == [{"bearerAuth": []}]
+    assert rejected.status_code == 401
+    assert rejected.json()["error"]["code"] == "unauthorized"
+    assert accepted.status_code == 200
+    assert "chapter-02.md" in accepted.json()["documents"]
 
 
 def test_local_status_rejects_non_local_host(manuscript_root: Path) -> None:

@@ -2,7 +2,7 @@
 
 Manuscript Workspace is a local-first MCP server that lets ChatGPT Developer Mode safely read, search, edit, and restore files in a manuscript folder. It does not create another chatbot UI and it does not call the OpenAI API for reasoning. ChatGPT remains the writing partner; this server only exposes carefully scoped local document tools.
 
-The server exposes Streamable HTTP at `/mcp` and a content-free health endpoint at `/health`.
+The server exposes Streamable HTTP at `/mcp`, a static OpenAPI Actions surface at `/actions/openapi.json`, and a content-free health endpoint at `/health`.
 
 ## Security Model
 
@@ -139,6 +139,60 @@ Less-private development alternative:
 3. In ChatGPT Developer Mode, create an app using the public HTTPS `/mcp` URL from the tunnel, for example `https://your-subdomain.ngrok.app/mcp`.
 
 Use the HTTPS tunnel only when you are comfortable with the tunnel provider and URL exposure. Secure MCP Tunnel is the better default for private manuscripts because the local server does not need inbound internet access.
+
+## Fallback: Custom GPT Actions
+
+If ChatGPT Developer Mode discovers MCP tools but keeps routing calls back through schema discovery, use the static Actions surface instead. It exposes the same core manuscript operations as ordinary OpenAPI actions with stable operation IDs such as `read_document`, `list_documents`, and `apply_patch`.
+
+Open the public base URL in a browser for a one-screen setup page:
+
+```text
+https://YOUR-NGROK-DOMAIN/
+```
+
+Actions OpenAPI URL:
+
+```text
+https://YOUR-NGROK-DOMAIN/openapi.json
+```
+
+For your current local ngrok setup, that shape is:
+
+```text
+https://dynasty-salvation-balmy.ngrok-free.dev/openapi.json
+```
+
+In the Custom GPT builder, add an Action and import that OpenAPI URL. The GPT should then receive first-class actions like:
+
+```text
+read_document
+list_documents
+search_documents
+apply_patch
+```
+
+To read Chapter 6 through Actions, use:
+
+```json
+{
+  "relative_path": "chapter-06.md",
+  "maximum_characters": 30000
+}
+```
+
+Optional protection for Actions endpoints:
+
+```bash
+MANUSCRIPT_ACTIONS_BEARER_TOKEN=choose-a-long-random-token
+```
+
+When that variable is set, `/actions/*` POST endpoints require:
+
+```text
+Authorization: Bearer choose-a-long-random-token
+```
+
+Configure the same bearer token in the Custom GPT Action authentication settings. The `/actions/openapi.json` schema remains readable so the GPT builder can import it. MCP at `/mcp`, local image-save endpoints, and manuscript path security behavior are unchanged.
 
 ## Durable macOS Setup With ngrok
 
@@ -334,33 +388,35 @@ SVG files are skipped during PDF export because the exporter embeds raster image
 
 Read tools:
 
-- `manuscript.get_project_overview`
-- `manuscript.list_documents`
-- `manuscript.read_document`
-- `manuscript.read_documents`
-- `manuscript.read_project_context`
-- `manuscript.search_documents`
-- `manuscript.get_document_history`
+- `get_project_overview`
+- `list_documents`
+- `read_document`
+- `read_documents`
+- `read_project_context`
+- `search_documents`
+- `get_document_history`
 
 Write tools:
 
-- `manuscript.create_document`
-- `manuscript.append_document`
-- `manuscript.apply_patch`
-- `manuscript.write_document`
-- `manuscript.rename_document`
-- `manuscript.restore_document_version`
-- `manuscript.delete_document`, only when deletion is enabled
+- `create_document`
+- `append_document`
+- `apply_patch`
+- `write_document`
+- `rename_document`
+- `restore_document_version`
+- `delete_document`, only when deletion is enabled
 
 Read tools are annotated with `readOnlyHint: true`. Write tools are annotated as local-world tools, and full overwrite, restore, and delete tools carry destructive hints.
 
+Tool names are simple by default for ChatGPT compatibility, so ChatGPT should display callable targets such as `Manuscript_Workspace.read_document`. Set `MANUSCRIPT_LEGACY_DOTTED_TOOLS=1` before starting the server only if you need the older MCP names such as `manuscript.read_document`.
+
 Image MCP tools are opt-in because some ChatGPT connector sessions are more reliable with the smaller core discovery surface. Set `MANUSCRIPT_ENABLE_IMAGE_MCP_TOOLS=1` before starting the server to also expose:
 
-- `manuscript.list_importable_images`
-- `manuscript.list_workspace_images`
-- `manuscript.get_image_metadata`
-- `manuscript.import_image`
-- `manuscript.save_image_base64`
+- `list_importable_images`
+- `list_workspace_images`
+- `get_image_metadata`
+- `import_image`
+- `save_image_base64`
 
 The browser extension's local "Save to Workspace" image endpoint does not require these optional MCP tools.
 
@@ -372,7 +428,7 @@ Before every mutation, the previous file content is saved under:
 .manuscript-history/versions/<version-id>/
 ```
 
-Each version records the relative path, timestamp, operation, old and new revisions when available, and change summary. Use `manuscript.get_document_history` to inspect versions and `manuscript.restore_document_version` to restore one. Restoration creates its own undo snapshot first.
+Each version records the relative path, timestamp, operation, old and new revisions when available, and change summary. Use `get_document_history` to inspect versions and `restore_document_version` to restore one. Restoration creates its own undo snapshot first.
 
 This history system does not require Git and never commits or modifies Git state.
 
